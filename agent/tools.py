@@ -20,6 +20,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from rapidfuzz import fuzz, utils
+
 from agent import db
 from agent.auth import AuthContext, can_cancel_order, permission_denied
 from agent.helpcenter import load_policy_docs
@@ -27,6 +29,14 @@ from agent.killswitch import kill_switch
 
 MAX_SEARCH_LIMIT = 25
 DEFAULT_ORDER_LIMIT = 20
+MAX_FIND_ORDER_RESULTS = 5
+# Minimum rapidfuzz WRatio (0 to 100) for a product title to count as a match.
+FIND_ORDER_MIN_SCORE = 80
+
+
+def _error(code: str, reason: str) -> dict[str, Any]:
+    """The structured failure every homework tool returns."""
+    return {"ok": False, "error": code, "reason": reason}
 
 
 def get_policy(ctx: AuthContext, policy_id: str) -> dict[str, Any]:
@@ -52,8 +62,16 @@ def get_policy(ctx: AuthContext, policy_id: str) -> dict[str, Any]:
     Implementation notes:
         agent.helpcenter.load_policy_docs() returns every parsed doc.
     """
-    ### YOUR CODE HERE (HW1)
-    raise NotImplementedError("HW1: implement get_policy")
+    for doc in load_policy_docs():
+        if doc.policy_id == policy_id:
+            return {
+                "ok": True,
+                "policy_id": doc.policy_id,
+                "title": doc.title,
+                "audience": doc.audience,
+                "body": doc.body,
+            }
+    return _error("not_found", f"no policy with id '{policy_id}'")
 
 
 def search_products(
@@ -95,8 +113,40 @@ def search_products(
         agent.db.list_products(conn, store_id) gives the candidate set.
         Use `with db.connection() as conn:` to close the database automatically.
     """
-    ### YOUR CODE HERE (HW1)
-    raise NotImplementedError("HW1: implement search_products")
+    tokens = query.lower().split()
+    if not tokens:
+        return _error("invalid_argument", "empty query")
+    if max_price_usd is not None and max_price_usd <= 0:
+        return _error("invalid_argument", "max_price_usd must be positive")
+    limit = max(1, min(limit, MAX_SEARCH_LIMIT))
+    with db.connection() as conn:
+        store_id = None
+        if store is not None:
+            match = db.get_store_by_name(conn, store)
+            if match is None:
+                return _error("not_found", f"no store named '{store}'")
+            store_id = match.id
+        candidates = db.list_products(conn, store_id)
+    matches = []
+    for product in candidates:
+        # A defective row can carry an empty title or description.
+        text = f"{product.title or ''} {product.description or ''}".lower()
+        if not all(token in text for token in tokens):
+            continue
+        if max_price_usd is not None and product.price_usd > max_price_usd:
+            continue
+        matches.append(product)
+    matches.sort(key=lambda product: (product.price_usd, product.id))
+    products = [
+        {
+            "product_id": product.id,
+            "store_id": product.store_id,
+            "title": product.title,
+            "price_usd": product.price_usd,
+        }
+        for product in matches[:limit]
+    ]
+    return {"ok": True, "products": products, "count": len(products)}
 
 
 def list_my_orders(ctx: AuthContext) -> dict[str, Any]:
@@ -121,8 +171,19 @@ def list_my_orders(ctx: AuthContext) -> dict[str, Any]:
         scope is baked into which query you run. That is the point of the
         tool: the model cannot ask for someone else's orders through it.
     """
-    ### YOUR CODE HERE (HW1)
-    raise NotImplementedError("HW1: implement list_my_orders")
+    if ctx.role == "support":
+        return _error(
+            "invalid_argument",
+            "support staff have no orders of their own; "
+            "look up a specific order with get_order instead",
+        )
+    with db.connection() as conn:
+        if ctx.role == "shopper":
+            orders = db.list_orders_for_user(conn, ctx.user_id, DEFAULT_ORDER_LIMIT)
+        else:  # merchant; AuthContext guarantees a store_id
+            orders = db.list_orders_for_store(conn, ctx.store_id, DEFAULT_ORDER_LIMIT)
+    payload = [order.to_public_dict() for order in orders]
+    return {"ok": True, "orders": payload, "count": len(payload)}
 
 
 def cancel_order(ctx: AuthContext, order_id: int, reason: str) -> dict[str, Any]:
@@ -167,8 +228,22 @@ def cancel_order(ctx: AuthContext, order_id: int, reason: str) -> dict[str, Any]
     paused = kill_switch("cancel_order")
     if paused is not None:
         return {"ok": False, "error": "paused", "reason": paused}
-    ### YOUR CODE HERE (HW1)
-    raise NotImplementedError("HW1: implement cancel_order")
+    with db.connection() as conn:
+        order = db.get_order(conn, order_id)
+        if order is None:
+            return _error("not_found", f"no order #{order_id}")
+        if not can_cancel_order(ctx, order.user_id, order.store_id):
+            return permission_denied(
+                f"role '{ctx.role}' (user {ctx.user_id}) may not cancel order #{order_id}"
+            )
+        if order.status != "placed":
+            return _error(
+                "not_eligible",
+                f"order #{order_id} has status '{order.status}'; "
+                f"orders can be cancelled only before shipment",
+            )
+        db.set_order_status(conn, order_id, "cancelled")
+    return {"ok": True, "order_id": order_id, "status": "cancelled"}
 
 
 def find_order(ctx: AuthContext, query: str) -> dict[str, Any]:
@@ -202,5 +277,33 @@ def find_order(ctx: AuthContext, query: str) -> dict[str, Any]:
         (at most 5), each as the dict returned by agent.db. If no orders
         match, return {"ok": True, "orders": []}.
     """
-    ### YOUR CODE HERE (HW1)
-    raise NotImplementedError("HW1: implement find_order")
+    # The scope comes from the authenticated context only, with no fallback
+    # to an unrestricted search.
+    if ctx.role == "shopper":
+        scope: dict[str, Any] = {"user_id": ctx.user_id}
+    elif ctx.role == "merchant" and ctx.store_id is not None:
+        scope = {"store_id": ctx.store_id}
+    elif ctx.role == "support":
+        scope = {"all_orders": True}
+    else:
+        return permission_denied(
+            f"role '{ctx.role}' (user {ctx.user_id}) has no order search scope"
+        )
+    with db.connection() as conn:
+        candidates = db.list_order_search_candidates(conn, **scope)
+        titles = {product.id: product.title or "" for product in db.list_products(conn)}
+    # Score each product in scope once. WRatio tolerates typos and filler
+    # words ("heavy duty vaes I bought"). Keep only the best-scoring products,
+    # so "walnut novel" does not also return a "Walnut Wooden Train".
+    scores = {
+        product_id: fuzz.WRatio(query, titles.get(product_id, ""), processor=utils.default_process)
+        for product_id in {order.product_id for order in candidates}
+    }
+    best = max(scores.values(), default=0)
+    if best < FIND_ORDER_MIN_SCORE:
+        return {"ok": True, "orders": []}
+    matches = [order for order in candidates if scores[order.product_id] == best]
+    return {
+        "ok": True,
+        "orders": [order.to_public_dict() for order in matches[:MAX_FIND_ORDER_RESULTS]],
+    }

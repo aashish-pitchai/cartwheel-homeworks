@@ -72,9 +72,14 @@ or credential changes, and anything outside Cartwheel.
   order's refund eligibility.
 
 ## Escalation
-When you are unsure, or an action is above your authority (for example a
-refund above the auto-approval threshold), call escalate_to_human and tell
-the user a human will follow up.
+When you are unsure, or an action is above your authority, call
+escalate_to_human and tell the user a human will follow up.
+You MUST call escalate_to_human, then tell the user a human will follow up
+within the sla_hours it returns, for:
+- any account change request, such as an email address. Do not only refuse it.
+- any dispute of a charge (cw-disputes). Do not offer a refund instead.
+- any order record with missing or inconsistent information, such as a
+  data_issues entry. Do not ask the user to supply the missing value.
 
 ## Tone
 Plain and warm. No legalese.
@@ -427,6 +432,45 @@ def find_order(
     return _call(wrapper, hw_tools.find_order, query)
 
 
+@function_tool
+def check_return_eligibility(
+    wrapper: RunContextWrapper[AuthContext], order_id: int
+) -> dict[str, Any]:
+    """Explain whether one order can be returned or refunded: its return window
+    (store override or platform default), deadline, days remaining, any restocking
+    fee, the policy ids to cite, and any data issues in the order record."""
+    return _call(wrapper, hw_tools.check_return_eligibility, order_id)
+
+
+@function_tool
+def track_shipment(
+    wrapper: RunContextWrapper[AuthContext], order_id: int
+) -> dict[str, Any]:
+    """Report one order's shipment stage, recorded dates, expected ship-by and
+    delivery-by dates, whether it is overdue, and any data issues. Carrier
+    tracking numbers are not available."""
+    return _call(wrapper, hw_tools.track_shipment, order_id)
+
+
+@function_tool
+def get_store_info(
+    wrapper: RunContextWrapper[AuthContext], store: str
+) -> dict[str, Any]:
+    """Look up a store's public information and policy overrides (return window,
+    restocking fee) by store name, slug, or numeric store id."""
+    return _call(wrapper, hw_tools.get_store_info, store)
+
+
+@function_tool
+def summarize_order_history(
+    wrapper: RunContextWrapper[AuthContext], customer_user_id: int | None = None
+) -> dict[str, Any]:
+    """Summarize all orders in your scope: counts and totals by status, refund-eligible
+    and open orders, and the most recent orders. Shoppers and merchants omit
+    customer_user_id; support staff must give the customer's user id."""
+    return _call(wrapper, hw_tools.summarize_order_history, customer_user_id)
+
+
 # Progressive disclosure: a session exposes only the tools its role can use.
 # Fewer tools mean fewer wrong choices and cleaner evals. At dev scale the
 # only difference is that support staff, who have no orders of their own,
@@ -439,6 +483,11 @@ _COMMON_TOOLS = [
     issue_refund,
     cancel_order,
     escalate_to_human,
+    # HW1 Part A additions; each checks scope itself, like the tools above.
+    check_return_eligibility,
+    track_shipment,
+    get_store_info,
+    summarize_order_history,
 ]
 TOOLS_BY_ROLE = {
     "shopper": _COMMON_TOOLS + [list_my_orders, find_order],

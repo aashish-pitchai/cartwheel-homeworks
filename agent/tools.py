@@ -18,14 +18,17 @@ They are marked xfail and flip to passing as you implement each function.
 
 from __future__ import annotations
 
+from datetime import date, timedelta
 from typing import Any
 
 from rapidfuzz import fuzz, utils
 
 from agent import db
-from agent.auth import AuthContext, can_cancel_order, permission_denied
+from agent.auth import AuthContext, can_cancel_order, can_view_order, permission_denied
+from agent.config import load_facts
 from agent.helpcenter import load_policy_docs
 from agent.killswitch import kill_switch
+from seed.eligibility import effective_return_window_days
 
 MAX_SEARCH_LIMIT = 25
 DEFAULT_ORDER_LIMIT = 20
@@ -306,4 +309,302 @@ def find_order(ctx: AuthContext, query: str) -> dict[str, Any]:
     return {
         "ok": True,
         "orders": [order.to_public_dict() for order in matches[:MAX_FIND_ORDER_RESULTS]],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Additional tools (HW1 Part A). Same conventions as the tools above: read
+# tools, scope checked with agent.auth before anything about an order is
+# returned, and structured results. None of them writes to the database.
+# ---------------------------------------------------------------------------
+
+RECENT_ORDERS_IN_SUMMARY = 5
+
+
+def _order_data_issues(conn: Any, order: db.Order) -> list[dict[str, str]]:
+    """Inconsistencies in an order record that make its dates untrustworthy.
+
+    The seed plants defective records on purpose (the data_quality_cases
+    table). A tool reports them instead of computing a deadline or an
+    estimate from bad data, so the model can say the record is inconsistent
+    and escalate. The codes match data_quality_cases.defect_type.
+    """
+    issues = []
+    if order.shipped_at and order.delivered_at and order.shipped_at > order.delivered_at:
+        issues.append({
+            "code": "reversed_chronology",
+            "detail": f"shipped_at {order.shipped_at} is after delivered_at {order.delivered_at}",
+        })
+    if order.status == "delivered" and order.delivered_at is None:
+        issues.append({
+            "code": "missing_required_date",
+            "detail": "status is 'delivered' but delivered_at is missing",
+        })
+    products = {product.id: product for product in db.list_products(conn, order.store_id)}
+    if order.product_id not in products:
+        issues.append({
+            "code": "store_mismatch",
+            "detail": f"product {order.product_id} does not belong to store {order.store_id}",
+        })
+    return issues
+
+
+def _store_policy_id(store: db.Store) -> str | None:
+    """The store's own policy doc id, or None when the store has none."""
+    policy_id = f"store-{store.slug}-policy"
+    return policy_id if any(doc.policy_id == policy_id for doc in load_policy_docs()) else None
+
+
+def _load_order_in_scope(
+    conn: Any, ctx: AuthContext, order_id: int, action: str
+) -> db.Order | dict[str, Any]:
+    """The order, or the not_found / permission_denied result get_order uses."""
+    order = db.get_order(conn, order_id)
+    if order is None:
+        return _error("not_found", f"no order #{order_id}")
+    if not can_view_order(ctx, order.user_id, order.store_id):
+        return permission_denied(
+            f"role '{ctx.role}' (user {ctx.user_id}) may not {action} order #{order_id}"
+        )
+    return order
+
+
+def check_return_eligibility(ctx: AuthContext, order_id: int) -> dict[str, Any]:
+    """Explain whether an order can be returned or refunded. Risk tier: read.
+
+    Scope is the same as get_order (agent.auth.can_view_order), checked
+    before anything about the order is returned.
+
+    Returns:
+        If no order has this id: {"ok": False, "error": "not_found", ...}.
+        Out of scope: agent.auth.permission_denied(...).
+        On success: {"ok": True, "order_id", "status", "refund_eligible",
+        "delivered_at", "return_window_days", "window_source",
+        "return_deadline", "days_remaining", "restocking_fee_may_apply",
+        "restocking_fee_max_percent", "policy_ids", "data_issues"}.
+        `refund_eligible` is the stamped flag issue_refund enforces.
+        `return_deadline` and `days_remaining` are None when the order has
+        no delivery date or when `data_issues` is non-empty.
+    """
+    facts = load_facts()
+    with db.connection() as conn:
+        order = _load_order_in_scope(conn, ctx, order_id, "check")
+        if isinstance(order, dict):
+            return order
+        store = db.get_store(conn, order.store_id)
+        as_of = db.world_asof(conn)
+        data_issues = _order_data_issues(conn, order)
+    override = store.return_window_days_override if store else None
+    window = effective_return_window_days(facts["return_window_days"], override)
+    deadline: date | None = None
+    if order.delivered_at is not None and not data_issues:
+        deadline = order.delivered_at + timedelta(days=window)
+    fee_opt_in = bool(store and store.restocking_fee_opt_in)
+    policy_ids = ["cw-returns"]
+    store_policy = _store_policy_id(store) if store else None
+    if store_policy:
+        policy_ids.append(store_policy)
+    if fee_opt_in:
+        policy_ids.append("cw-restocking-fees")
+    return {
+        "ok": True,
+        "order_id": order.id,
+        "status": order.status,
+        "refund_eligible": order.refund_eligible,
+        "delivered_at": order.delivered_at.isoformat() if order.delivered_at else None,
+        "return_window_days": window,
+        "window_source": "store_override" if override is not None else "platform_default",
+        "return_deadline": deadline.isoformat() if deadline else None,
+        "days_remaining": max((deadline - as_of).days, 0) if deadline else None,
+        "restocking_fee_may_apply": fee_opt_in,
+        "restocking_fee_max_percent": facts["restocking_fee_max_percent"] if fee_opt_in else None,
+        "policy_ids": policy_ids,
+        "data_issues": data_issues,
+    }
+
+
+def track_shipment(ctx: AuthContext, order_id: int) -> dict[str, Any]:
+    """Report an order's shipment stage and expected dates. Risk tier: read.
+
+    Scope is the same as get_order (agent.auth.can_view_order), checked
+    before anything about the order is returned. Cartwheel stores no carrier
+    tracking numbers, so none are returned.
+
+    Returns:
+        If no order has this id: {"ok": False, "error": "not_found", ...}.
+        Out of scope: agent.auth.permission_denied(...).
+        On success: {"ok": True, "order_id", "status", "store_name",
+        "ordered_at", "shipped_at", "delivered_at", "expected_ship_by",
+        "expected_delivery_by", "overdue", "policy_ids", "data_issues"}.
+        Expected dates use facts.yaml shipping_handling_days_max and
+        shipping_transit_days_max: ship_by is set only for a placed order,
+        delivery_by only for a placed or shipped order. Both are None, and
+        `overdue` is False, when `data_issues` is non-empty.
+    """
+    facts = load_facts()
+    handling = timedelta(days=facts["shipping_handling_days_max"])
+    transit = timedelta(days=facts["shipping_transit_days_max"])
+    with db.connection() as conn:
+        order = _load_order_in_scope(conn, ctx, order_id, "track")
+        if isinstance(order, dict):
+            return order
+        store = db.get_store(conn, order.store_id)
+        as_of = db.world_asof(conn)
+        data_issues = _order_data_issues(conn, order)
+    ship_by = delivery_by = None
+    if not data_issues:
+        if order.status == "placed":
+            ship_by = order.ordered_at + handling
+            delivery_by = ship_by + transit
+        elif order.status == "shipped" and order.shipped_at is not None:
+            delivery_by = order.shipped_at + transit
+    overdue = bool(
+        (ship_by and as_of > ship_by) or (delivery_by and as_of > delivery_by)
+    )
+    return {
+        "ok": True,
+        "order_id": order.id,
+        "status": order.status,
+        "store_name": store.name if store else None,
+        "ordered_at": order.ordered_at.isoformat(),
+        "shipped_at": order.shipped_at.isoformat() if order.shipped_at else None,
+        "delivered_at": order.delivered_at.isoformat() if order.delivered_at else None,
+        "expected_ship_by": ship_by.isoformat() if ship_by else None,
+        "expected_delivery_by": delivery_by.isoformat() if delivery_by else None,
+        "overdue": overdue,
+        "policy_ids": ["cw-shipping"],
+        "data_issues": data_issues,
+    }
+
+
+def get_store_info(ctx: AuthContext, store: str) -> dict[str, Any]:
+    """Look up a store's public information and policy overrides. Risk tier: read.
+
+    Store information is public help-center content, so every role may read
+    every store and no permission check is needed (as with get_policy).
+
+    Args:
+        ctx: The caller's auth context.
+        store: A store name or slug (agent.db.get_store_by_name), or a numeric
+            store id such as the store_id on an order.
+
+    Returns:
+        Empty store: {"ok": False, "error": "invalid_argument", ...}.
+        Unknown store: {"ok": False, "error": "not_found", ...}.
+        On success: {"ok": True, "store_id", "name", "slug", "category",
+        "return_window_days", "window_source", "restocking_fee_opt_in",
+        "restocking_fee_max_percent", "policy_ids"}, where policy_ids lists
+        the store's own policy doc when it has one.
+    """
+    store = store.strip()
+    if not store:
+        return _error("invalid_argument", "empty store")
+    facts = load_facts()
+    with db.connection() as conn:
+        match = db.get_store(conn, int(store)) if store.isdigit() else None
+        match = match or db.get_store_by_name(conn, store)
+    if match is None:
+        return _error("not_found", f"no store matching '{store}'")
+    override = match.return_window_days_override
+    policy_ids = ["cw-store-overrides"]
+    store_policy = _store_policy_id(match)
+    if store_policy:
+        policy_ids.append(store_policy)
+    return {
+        "ok": True,
+        "store_id": match.id,
+        "name": match.name,
+        "slug": match.slug,
+        "category": match.category,
+        "return_window_days": effective_return_window_days(facts["return_window_days"], override),
+        "window_source": "store_override" if override is not None else "platform_default",
+        "restocking_fee_opt_in": match.restocking_fee_opt_in,
+        "restocking_fee_max_percent": (
+            facts["restocking_fee_max_percent"] if match.restocking_fee_opt_in else None
+        ),
+        "policy_ids": policy_ids,
+    }
+
+
+def summarize_order_history(
+    ctx: AuthContext, customer_user_id: int | None = None
+) -> dict[str, Any]:
+    """Summarize every order in one scope. Risk tier: read.
+
+    Role behavior, following the access matrix in SPEC.md:
+        - shopper: the caller's own orders. Naming any other customer
+          returns permission_denied.
+        - merchant: the caller's store's orders. Naming a customer returns
+          permission_denied, because order records shown to merchants do not
+          identify customers.
+        - support: the named customer's orders. customer_user_id is required
+          (invalid_argument without it), must exist (not_found), and must be
+          a shopper (invalid_argument otherwise).
+
+    Unlike list_my_orders, the summary covers the whole scope, not only the
+    20 most recent orders.
+
+    Returns:
+        {"ok": True, "scope": "shopper" | "store", "customer_user_id",
+        "store_id", "order_count", "total_usd", "first_ordered_at",
+        "last_ordered_at", "by_status", "refund_eligible_order_ids",
+        "open_order_ids", "recent_orders"}. by_status maps each status to
+        {"count", "total_usd"}; recent_orders holds the newest
+        RECENT_ORDERS_IN_SUMMARY orders as to_public_dict(). An empty scope
+        is still a success with order_count 0.
+    """
+    if ctx.role == "shopper":
+        if customer_user_id not in (None, ctx.user_id):
+            return permission_denied(
+                f"role 'shopper' (user {ctx.user_id}) may not view the orders of "
+                f"user {customer_user_id}"
+            )
+        scope: dict[str, Any] = {"user_id": ctx.user_id}
+    elif ctx.role == "merchant" and ctx.store_id is not None:
+        if customer_user_id is not None:
+            return permission_denied(
+                f"role 'merchant' (user {ctx.user_id}) may summarize only store "
+                f"{ctx.store_id}'s orders, not a customer's history"
+            )
+        scope = {"store_id": ctx.store_id}
+    elif ctx.role == "support":
+        if customer_user_id is None:
+            return _error(
+                "invalid_argument",
+                "support staff must name the customer_user_id to summarize",
+            )
+        scope = {"user_id": customer_user_id}
+    else:
+        return permission_denied(
+            f"role '{ctx.role}' (user {ctx.user_id}) has no order history scope"
+        )
+    with db.connection() as conn:
+        if ctx.role == "support":
+            customer = db.get_user(conn, customer_user_id)
+            if customer is None:
+                return _error("not_found", f"no user #{customer_user_id}")
+            if customer.role != "shopper":
+                return _error(
+                    "invalid_argument",
+                    f"user #{customer_user_id} is a {customer.role}, not a shopper",
+                )
+        orders = db.list_order_search_candidates(conn, **scope)
+    by_status: dict[str, dict[str, Any]] = {}
+    for order in orders:
+        bucket = by_status.setdefault(order.status, {"count": 0, "total_usd": 0.0})
+        bucket["count"] += 1
+        bucket["total_usd"] = round(bucket["total_usd"] + order.total_usd, 2)
+    return {
+        "ok": True,
+        "scope": "store" if "store_id" in scope else "shopper",
+        "customer_user_id": scope.get("user_id"),
+        "store_id": scope.get("store_id"),
+        "order_count": len(orders),
+        "total_usd": round(sum(order.total_usd for order in orders), 2),
+        "first_ordered_at": min(o.ordered_at for o in orders).isoformat() if orders else None,
+        "last_ordered_at": max(o.ordered_at for o in orders).isoformat() if orders else None,
+        "by_status": dict(sorted(by_status.items())),
+        "refund_eligible_order_ids": [o.id for o in orders if o.refund_eligible],
+        "open_order_ids": [o.id for o in orders if o.status in ("placed", "shipped")],
+        "recent_orders": [o.to_public_dict() for o in orders[:RECENT_ORDERS_IN_SUMMARY]],
     }
